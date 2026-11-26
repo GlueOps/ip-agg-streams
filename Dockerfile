@@ -7,7 +7,7 @@ COPY src src
 RUN mvn -q -B -DskipTests package
 
 # glibc base (not alpine): snappy-java and RocksDB ship glibc native libraries.
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:25-jre@sha256:4ed132f6832e9804b123e89a849a7b4502756ae64a4ee08ebab939d9d5d0a9fa
 RUN useradd --system --uid 10001 app && mkdir /state && chown app /state
 WORKDIR /app
 COPY --from=build /src/target/ip-agg-streams-*.jar app.jar
