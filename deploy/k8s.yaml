@@ -1,0 +1,115 @@
+# Rendered by deploy/run.sh (envsubst). ip-agg-streams as a StatefulSet: stable pod names keep the instance label of the
+# pushed series stable across restarts. State is on an emptyDir; Kafka Streams restores it from the changelog topic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ip-agg-streams
+  namespace: ${NAMESPACE}
+  labels:
+    app: ip-agg-streams
+spec:
+  clusterIP: None
+  selector:
+    app: ip-agg-streams
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ip-agg-streams
+  namespace: ${NAMESPACE}
+  labels:
+    app: ip-agg-streams
+spec:
+  serviceName: ip-agg-streams
+  replicas: ${REPLICAS}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: ip-agg-streams
+  template:
+    metadata:
+      labels:
+        app: ip-agg-streams
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 10001
+      initContainers:
+        # Creates the input topic before the collector's kafka exporter does: an auto-created topic gets the broker's
+        # default of 1 partition, which caps the app at one stream thread.
+        - name: create-topic
+          image: ${KAFKA_IMAGE}
+          command: ["sh", "-c"]
+          args:
+            - /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists
+              --topic "$TOPIC" --partitions "$PARTITIONS" --config retention.ms="$RETENTION_MS"
+              --config compression.type=producer
+          env:
+            - {name: BOOTSTRAP, value: "${KAFKA_BOOTSTRAP_SERVERS}"}
+            - {name: TOPIC, value: "${INPUT_TOPIC}"}
+            - {name: PARTITIONS, value: "${PARTITIONS}"}
+            - {name: RETENTION_MS, value: "${RETENTION_MS}"}
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {memory: 512Mi}
+      containers:
+        - name: app
+          image: ${IMAGE}
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: KAFKA_BOOTSTRAP_SERVERS, value: "${KAFKA_BOOTSTRAP_SERVERS}"}
+            - {name: KAFKA_APPLICATION_ID, value: "${APPLICATION_ID}"}
+            - {name: KAFKA_STREAM_THREADS, value: "${STREAM_THREADS}"}
+            - {name: INPUT_TOPIC, value: "${INPUT_TOPIC}"}
+            - {name: INPUT_FORMAT, value: "${INPUT_FORMAT}"}
+            - {name: REMOTE_WRITE_URLS, value: "${REMOTE_WRITE_URLS}"}
+            - {name: TOP_IPS, value: "${TOP_IPS}"}
+            - {name: TOP_PAIRS, value: "${TOP_PAIRS}"}
+            - {name: TOP_IPS_PER_ROUTE, value: "${TOP_IPS_PER_ROUTE}"}
+            - {name: MAX_ROUTES, value: "${MAX_ROUTES}"}
+            - {name: ROCKSDB_CACHE_MB, value: "128"}
+            - {name: ROCKSDB_WRITE_BUFFER_MB, value: "64"}
+          readinessProbe:
+            httpGet: {path: /actuator/health/readiness, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /actuator/health/liveness, port: http}
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests: {cpu: "${CPU_REQUEST}", memory: "${MEMORY}"}
+            limits: {memory: "${MEMORY}"}
+          volumeMounts:
+            - {name: state, mountPath: /state}
+      volumes:
+        - name: state
+          emptyDir:
+            sizeLimit: 5Gi
+---
+# Health metrics (input spans by outcome, Kafka Streams lag/rates, push results) scraped from /actuator/prometheus.
+# The IP views themselves are pushed via remote write, not scraped.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ip-agg-streams
+  namespace: ${NAMESPACE}
+  labels:
+    app: ip-agg-streams
+spec:
+  selector:
+    matchLabels:
+      app: ip-agg-streams
+  # A bug that blew up the health metrics' series must not reach Prometheus.
+  sampleLimit: 5000
+  endpoints:
+    - port: http
+      path: /actuator/prometheus
+      interval: 30s

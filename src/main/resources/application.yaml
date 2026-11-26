@@ -1,0 +1,65 @@
+spring:
+  application:
+    name: ip-agg-streams
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    streams:
+      # Also the consumer group and the prefix of the internal topics (<id>-by-ip-repartition, <id>-ip-route-counts-changelog).
+      application-id: ${KAFKA_APPLICATION_ID:ip-agg-streams}
+      state-dir: ${KAFKA_STATE_DIR:/tmp/kafka-streams}
+      # -1 = the broker's default.replication.factor (1 on the single Tempo broker)
+      replication-factor: ${KAFKA_REPLICATION_FACTOR:-1}
+      properties:
+        num.stream.threads: ${KAFKA_STREAM_THREADS:2}
+        processing.guarantee: at_least_once
+        commit.interval.ms: 1000
+        # Record cache in front of the window store: repeated updates of a hot key are merged before RocksDB and the
+        # changelog. Interactive queries read through it, so the emitter sees the latest counts.
+        statestore.cache.max.bytes: ${KAFKA_STATESTORE_CACHE_BYTES:33554432}
+        rocksdb.config.setter: io.glueops.ipagg.streams.BoundedRocksDbConfig
+        # A new consumer group starts at the end of the topic instead of replaying the retained backlog.
+        auto.offset.reset: ${KAFKA_AUTO_OFFSET_RESET:latest}
+        # Repartition records are small (~40 B key + 8 B count); lingering a little batches them per round trip.
+        producer.linger.ms: 50
+        producer.compression.type: lz4
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        # A pod whose Kafka Streams client died (ERROR) is restarted rather than left running without processing.
+        liveness:
+          include: livenessState,kafkaStreams
+          show-details: always
+
+ipagg:
+  input-topic: ${INPUT_TOPIC:otlp-spans-ip}
+  input-format: ${INPUT_FORMAT:otlp_proto}
+  server-spans-only: ${SERVER_SPANS_ONLY:true}
+  instance: ${POD_NAME:${HOSTNAME:local}}
+  emit-check-interval-ms: 5000
+  window:
+    size: ${WINDOW_SIZE:1m}
+    grace: ${WINDOW_GRACE:10s}
+    max-wait: ${WINDOW_MAX_WAIT:60s}
+    extra-retention: 3m
+  views:
+    top-ips: ${TOP_IPS:100}
+    top-pairs: ${TOP_PAIRS:100}
+    top-ips-per-route: ${TOP_IPS_PER_ROUTE:10}
+    max-routes: ${MAX_ROUTES:200}
+  remote-write:
+    # Comma-separated; one per Prometheus replica, like the collector's prometheusremotewrite exporters.
+    urls: ${REMOTE_WRITE_URLS:}
+    job: ip-agg-streams
+    timeout: 10s
+    max-attempts: 3
